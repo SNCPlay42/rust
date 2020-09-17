@@ -1,0 +1,28 @@
+- // MIR for `not_id` before SimplifyBranchSame
++ // MIR for `not_id` after SimplifyBranchSame
+  
+  fn not_id(_1: Type) -> Type {
+      debug v => _1;                       // in scope 0 at $DIR/simplify-arm.rs:36:11: 36:12
+      let mut _0: Type;                    // return place in scope 0 at $DIR/simplify-arm.rs:36:23: 36:27
+      let mut _2: isize;                   // in scope 0 at $DIR/simplify-arm.rs:38:9: 38:16
+  
+      bb0: {
+          _2 = discriminant(_1);           // scope 0 at $DIR/simplify-arm.rs:38:9: 38:16
+          switchInt(move _2) -> [0_isize: bb2, otherwise: bb1]; // scope 0 at $DIR/simplify-arm.rs:38:9: 38:16
+      }
+  
+      bb1: {
+          _0 = move _1;                    // scope 0 at $DIR/simplify-arm.rs:39:14: 39:15
+          goto -> bb3;                     // scope 0 at $DIR/simplify-arm.rs:37:5: 40:6
+      }
+  
+      bb2: {
+          discriminant(_0) = 1;            // scope 0 at $DIR/simplify-arm.rs:38:20: 38:27
+          goto -> bb3;                     // scope 0 at $DIR/simplify-arm.rs:37:5: 40:6
+      }
+  
+      bb3: {
+          return;                          // scope 0 at $DIR/simplify-arm.rs:41:2: 41:2
+      }
+  }
+  

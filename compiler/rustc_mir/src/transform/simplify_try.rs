@@ -562,8 +562,8 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
             .basic_blocks()
             .iter_enumerated()
             .filter_map(|(bb_idx, bb)| {
-                let (discr_switched_on, targets) = match &bb.terminator().kind {
-                    TerminatorKind::SwitchInt { targets, discr, .. } => (discr, targets),
+                let (discr_switched_on, values, targets) = match &bb.terminator().kind {
+                    TerminatorKind::SwitchInt { targets, values, discr, .. } => (discr, values, targets),
                     _ => return None,
                 };
 
@@ -589,30 +589,31 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
 
                 let mut iter_bbs_reachable = targets
                     .iter()
-                    .map(|idx| (*idx, &self.body.basic_blocks()[*idx]))
-                    .filter(|(_, bb)| {
+                    .zip(values.iter().copied().map(Some).chain(std::iter::once(None)))
+                    .map(|(idx, val)| (*idx, &self.body.basic_blocks()[*idx], val))
+                    .filter(|(_, bb, _)| {
                         // Reaching `unreachable` is UB so assume it doesn't happen.
                         bb.terminator().kind != TerminatorKind::Unreachable
-                    // But `asm!(...)` could abort the program,
-                    // so we cannot assume that the `unreachable` terminator itself is reachable.
-                    // FIXME(Centril): use a normalization pass instead of a check.
-                    || bb.statements.iter().any(|stmt| match stmt.kind {
-                        StatementKind::LlvmInlineAsm(..) => true,
-                        _ => false,
-                    })
+                        // But `asm!(...)` could abort the program,
+                        // so we cannot assume that the `unreachable` terminator itself is reachable.
+                        // FIXME(Centril): use a normalization pass instead of a check.
+                        || bb.statements.iter().any(|stmt| match stmt.kind {
+                            StatementKind::LlvmInlineAsm(..) => true,
+                            _ => false,
+                        })
                     })
                     .peekable();
 
-                let bb_first = iter_bbs_reachable.peek().map(|(idx, _)| *idx).unwrap_or(targets[0]);
+                let bb_first = iter_bbs_reachable.peek().map(|(idx, _, _)| *idx).unwrap_or(targets[0]);
                 let mut all_successors_equivalent = StatementEquality::TrivialEqual;
 
                 // All successor basic blocks must be equal or contain statements that are pairwise considered equal.
-                for ((bb_l_idx,bb_l), (bb_r_idx,bb_r)) in iter_bbs_reachable.tuple_windows() {
+                for ((bb_l_idx,bb_l,l_disc_val), (bb_r_idx,bb_r,r_disc_val)) in iter_bbs_reachable.tuple_windows() {
                     let trivial_checks = bb_l.is_cleanup == bb_r.is_cleanup
                     && bb_l.terminator().kind == bb_r.terminator().kind;
                     let statement_check = || {
                         bb_l.statements.iter().zip(&bb_r.statements).try_fold(StatementEquality::TrivialEqual, |acc,(l,r)| {
-                            let stmt_equality = self.statement_equality(*adt_matched_on, &l, bb_l_idx, &r, bb_r_idx);
+                            let stmt_equality = self.statement_equality(*adt_matched_on, &l, bb_l_idx, l_disc_val, &r, bb_r_idx, r_disc_val);
                             if matches!(stmt_equality, StatementEquality::NotEqual) {
                                 // short circuit
                                 None
@@ -665,17 +666,21 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
     /// In this case the two statements are equal iff
     /// 1: _0 is an enum where the variant index 0 is fieldless, and
     /// 2:  bb1 was targeted by a switch where the discriminant of _1 was switched on
+    /// 3: the discriminant value assigned in bb1 is the discriminant of _1, as determined by that switch
     fn statement_equality(
         &self,
         adt_matched_on: Place<'tcx>,
         x: &Statement<'tcx>,
         x_bb_idx: BasicBlock,
+        x_disc_val: Option<u128>,
         y: &Statement<'tcx>,
         y_bb_idx: BasicBlock,
+        y_disc_val: Option<u128>,
     ) -> StatementEquality {
         let helper = |rhs: &Rvalue<'tcx>,
                       place: &Place<'tcx>,
                       variant_index: &VariantIdx,
+                      disc_val,
                       side_to_choose| {
             let place_type = place.ty(self.body, self.tcx).ty;
             let adt = match *place_type.kind() {
@@ -690,7 +695,17 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
 
             match rhs {
                 Rvalue::Use(operand) if operand.place() == Some(adt_matched_on) => {
-                    StatementEquality::ConsideredEqual(side_to_choose)
+                    let discriminant = adt.discriminant_for_variant(self.tcx, *variant_index).val;
+                    if disc_val != Some(discriminant) {
+                        trace!(
+                            "NO: not the same discriminant: {:?} != {:?}",
+                            disc_val,
+                            Some(discriminant),
+                        );
+                        StatementEquality::NotEqual
+                    } else {
+                        StatementEquality::ConsideredEqual(side_to_choose)
+                    }
                 }
                 _ => {
                     trace!(
@@ -712,14 +727,14 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
                 StatementKind::SetDiscriminant { place, variant_index },
             ) => {
                 // choose basic block of x, as that has the assign
-                helper(rhs, place, variant_index, x_bb_idx)
+                helper(rhs, place, variant_index, y_disc_val, x_bb_idx)
             }
             (
                 StatementKind::SetDiscriminant { place, variant_index },
                 StatementKind::Assign(box (_, rhs)),
             ) => {
                 // choose basic block of y, as that has the assign
-                helper(rhs, place, variant_index, y_bb_idx)
+                helper(rhs, place, variant_index, x_disc_val, y_bb_idx)
             }
             _ => {
                 trace!("NO: statements `{:?}` and `{:?}` not considered equal", x, y);
@@ -733,8 +748,11 @@ impl<'a, 'tcx> SimplifyBranchSameOptimizationFinder<'a, 'tcx> {
 enum StatementEquality {
     /// The two statements are trivially equal; same kind
     TrivialEqual,
-    /// The two statements are considered equal, but may be of different kinds. The BasicBlock field is the basic block to jump to when performing the branch-same optimization.
-    /// For example, `_0 = _1` and `discriminant(_0) = discriminant(0)` are considered equal if 0 is a fieldless variant of an enum. But we don't want to jump to the basic block with the SetDiscriminant, as that is not legal if _1 is not the 0 variant index
+    /// The two statements are considered equal, but may be of different kinds. The BasicBlock field
+    /// is the basic block to jump to when performing the branch-same optimization.
+    /// For example, `_0 = _1` and `discriminant(_0) = discriminant(0)` are considered equal if 0 is a
+    /// fieldless variant of an enum and _1 is known to have that variant. But we don't want to jump to
+    /// the basic block with the SetDiscriminant, as that is not legal if _1 is not the 0 variant index
     ConsideredEqual(BasicBlock),
     /// The two statements are not equal
     NotEqual,
